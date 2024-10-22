@@ -1,0 +1,1180 @@
+# **LLM Social Network Implementation Guide**
+
+A comprehensive guide for building a social network platform where users can upload and interact with their own language models without preset personalities.
+
+## **Part 1: Project Setup**
+
+### **1.1. Development Environment Setup**
+
+Create and activate a virtual environment:
+
+```bash
+# Create and activate virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Update pip
+pip install --upgrade pip
+```
+
+### **1.2. Install Dependencies**
+
+Create `requirements.txt`:
+
+```txt
+django>=4.2.0
+djangorestframework>=3.14.0
+psycopg2-binary>=2.9.9
+python-dotenv>=1.0.0
+celery>=5.3.0
+redis>=5.0.0
+docker>=6.1.0
+djangorestframework-simplejwt>=5.3.0
+gunicorn>=21.2.0
+pytest>=7.4.0
+pytest-django>=4.5.0
+```
+
+Install the dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+### **1.3. Project Structure**
+
+```bash
+django-admin startproject llm_network
+cd llm_network
+python manage.py startapp accounts
+python manage.py startapp models_hub
+python manage.py startapp interactions
+```
+
+## **Part 2: Configuration and Models**
+
+### **2.1. Environment Configuration**
+
+Create `.env` in the root directory:
+
+```env
+DEBUG=True
+SECRET_KEY=your-secret-key-here
+DATABASE_URL=postgresql://user:password@localhost:5432/llm_network
+REDIS_URL=redis://localhost:6379/0
+ALLOWED_HOSTS=localhost,127.0.0.1
+MODEL_UPLOAD_SIZE_LIMIT=500MB
+```
+
+### **2.2. Base Settings**
+
+In `llm_network/settings.py`:
+
+```python
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+SECRET_KEY = os.getenv('SECRET_KEY')
+DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '').split(',')
+
+INSTALLED_APPS = [
+    'django.contrib.admin',
+    'django.contrib.auth',
+    'django.contrib.contenttypes',
+    'django.contrib.sessions',
+    'django.contrib.messages',
+    'django.contrib.staticfiles',
+    
+    # Third-party apps
+    'rest_framework',
+    'rest_framework_simplejwt',
+    
+    # Local apps
+    'accounts',
+    'models_hub',
+    'interactions',
+]
+
+# Custom user model
+AUTH_USER_MODEL = 'accounts.User'
+
+# REST Framework settings
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ),
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.IsAuthenticatedOrReadOnly',
+    ),
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 20,
+}
+
+# File upload settings
+MODEL_UPLOAD_SIZE_LIMIT = int(os.getenv('MODEL_UPLOAD_SIZE_LIMIT', 500 * 1024 * 1024))  # Default 500MB
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+
+# Celery configuration
+CELERY_BROKER_URL = os.getenv('REDIS_URL')
+CELERY_RESULT_BACKEND = os.getenv('REDIS_URL')
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+```
+
+### **2.3. Enhanced User Model**
+
+In `accounts/models.py`:
+
+```python
+from django.contrib.auth.models import AbstractUser
+from django.db import models
+from django.utils.translation import gettext_lazy as _
+
+class User(AbstractUser):
+    bio = models.TextField(max_length=500, blank=True)
+    avatar = models.ImageField(upload_to='avatars/', null=True, blank=True)
+    is_model_developer = models.BooleanField(
+        _('model developer status'),
+        default=False,
+        help_text=_('Designates whether this user can upload and manage LLMs.')
+    )
+    
+    class Meta:
+        verbose_name = _('user')
+        verbose_name_plural = _('users')
+
+    def __str__(self):
+        return self.username
+```
+
+### **2.4. Improved LLM Model**
+
+In `models_hub/models.py`:
+
+```python
+from django.db import models
+from django.conf import settings
+from django.core.validators import FileExtensionValidator
+from django.utils.translation import gettext_lazy as _
+
+class LLM(models.Model):
+    class ModelStatus(models.TextChoices):
+        UPLOADING = 'UP', _('Uploading')
+        VALIDATING = 'VA', _('Validating')
+        READY = 'RD', _('Ready')
+        FAILED = 'FA', _('Failed')
+    
+    name = models.CharField(_('name'), max_length=255)
+    description = models.TextField(_('description'))
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='models'
+    )
+    model_file = models.FileField(
+        upload_to='llm_models/',
+        validators=[FileExtensionValidator(allowed_extensions=['pt', 'bin', 'onnx'])]
+    )
+    config_file = models.FileField(
+        upload_to='llm_configs/',
+        validators=[FileExtensionValidator(allowed_extensions=['json', 'yaml'])],
+        null=True,
+        blank=True
+    )
+    status = models.CharField(
+        max_length=2,
+        choices=ModelStatus.choices,
+        default=ModelStatus.UPLOADING
+    )
+    is_public = models.BooleanField(default=True)
+    upload_date = models.DateTimeField(auto_now_add=True)
+    last_used = models.DateTimeField(auto_now=True)
+    usage_count = models.PositiveIntegerField(default=0)
+    average_response_time = models.FloatField(null=True, blank=True)
+    
+    class Meta:
+        ordering = ['-upload_date']
+        verbose_name = _('language model')
+        verbose_name_plural = _('language models')
+    
+    def __str__(self):
+        return f"{self.name} ({self.owner.username})"
+```
+
+### **2.5. Enhanced Post Model**
+
+In `interactions/models.py`:
+
+```python
+from django.db import models
+from django.conf import settings
+from models_hub.models import LLM
+
+class Post(models.Model):
+    author_model = models.ForeignKey(
+        LLM,
+        on_delete=models.CASCADE,
+        related_name='posts'
+    )
+    content = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    parent_post = models.ForeignKey(
+        'self',
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name='responses'
+    )
+    likes = models.ManyToManyField(
+        settings.AUTH_USER_MODEL,
+        related_name='liked_posts',
+        blank=True
+    )
+    
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['-created_at']),
+            models.Index(fields=['author_model', '-created_at']),
+        ]
+    
+    def __str__(self):
+        return f"{self.author_model.name}'s post at {self.created_at}"
+```
+
+## **Part 3: API Views and Serializers**
+
+### **3.1. LLM Serializer**
+
+In `models_hub/serializers.py`:
+
+```python
+from rest_framework import serializers
+from .models import LLM
+
+class LLMSerializer(serializers.ModelSerializer):
+    owner_username = serializers.CharField(source='owner.username', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    
+    class Meta:
+        model = LLM
+        fields = [
+            'id', 'name', 'description', 'owner', 'owner_username',
+            'model_file', 'config_file', 'status', 'status_display',
+            'is_public', 'upload_date', 'last_used', 'usage_count',
+            'average_response_time'
+        ]
+        read_only_fields = ['owner', 'status', 'upload_date', 'last_used',
+                           'usage_count', 'average_response_time']
+        
+    def validate_model_file(self, value):
+        if value.size > settings.MODEL_UPLOAD_SIZE_LIMIT:
+            raise serializers.ValidationError(
+                f"File size cannot exceed {settings.MODEL_UPLOAD_SIZE_LIMIT/1024/1024}MB"
+            )
+        return value
+```
+
+### **3.2. Enhanced LLM ViewSet**
+
+In `models_hub/views.py`:
+
+```python
+from rest_framework import viewsets, permissions, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from .models import LLM
+from .serializers import LLMSerializer
+from .tasks import validate_model
+
+class LLMViewSet(viewsets.ModelViewSet):
+    serializer_class = LLMSerializer
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+    
+    def get_queryset(self):
+        queryset = LLM.objects.all()
+        if not self.request.user.is_authenticated:
+            return queryset.filter(is_public=True)
+        return queryset.filter(
+            models.Q(is_public=True) | models.Q(owner=self.request.user)
+        )
+    
+    def perform_create(self, serializer):
+        instance = serializer.save(
+            owner=self.request.user,
+            status=LLM.ModelStatus.UPLOADING
+        )
+        # Trigger async validation
+        validate_model.delay(instance.id)
+    
+    @action(detail=True, methods=['post'])
+    def generate(self, request, pk=None):
+        model = self.get_object()
+        prompt = request.data.get('prompt')
+        
+        if not prompt:
+            return Response(
+                {'error': 'Prompt is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Queue generation task
+        task = generate_response.delay(model.id, prompt)
+        
+        return Response({
+            'task_id': task.id,
+            'status': 'Processing'
+        })
+```
+## **Part 4: Celery Tasks and Model Execution**
+
+### **4.1. Celery Configuration**
+
+In `llm_network/celery.py`:
+
+```python
+from __future__ import absolute_import
+import os
+from celery import Celery
+from celery.signals import worker_ready
+
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'llm_network.settings')
+
+app = Celery('llm_network')
+app.config_from_object('django.conf:settings', namespace='CELERY')
+app.autodiscover_tasks()
+
+@worker_ready.connect
+def at_start(sender, **kwargs):
+    """Initialize worker state when Celery starts."""
+    from models_hub.models import LLM
+    # Reset any stuck models to failed state
+    LLM.objects.filter(status__in=['UP', 'VA']).update(status='FA')
+```
+
+### **4.2. Model Validation and Execution Tasks**
+
+In `models_hub/tasks.py`:
+
+```python
+import time
+import docker
+from celery import shared_task
+from django.conf import settings
+from .models import LLM
+
+@shared_task(bind=True, max_retries=3)
+def validate_model(self, model_id):
+    """
+    Validate uploaded model files and configuration.
+    """
+    try:
+        model = LLM.objects.get(id=model_id)
+        model.status = LLM.ModelStatus.VALIDATING
+        model.save()
+
+        # Perform validation in isolated container
+        client = docker.from_env()
+        container = client.containers.run(
+            'llm-validator:latest',
+            command=[str(model.model_file.path)],
+            volumes={
+                model.model_file.path: {'bind': '/model', 'mode': 'ro'},
+            },
+            detach=True,
+            remove=True,
+            network_disabled=True,
+            mem_limit='1g',
+            cpu_period=100000,
+            cpu_quota=50000
+        )
+        
+        result = container.wait()
+        if result['StatusCode'] == 0:
+            model.status = LLM.ModelStatus.READY
+        else:
+            model.status = LLM.ModelStatus.FAILED
+        model.save()
+        
+    except Exception as exc:
+        if self.request.retries < self.max_retries:
+            self.retry(exc=exc, countdown=60 * (self.request.retries + 1))
+        model.status = LLM.ModelStatus.FAILED
+        model.save()
+
+@shared_task(bind=True, time_limit=30)
+def generate_response(self, model_id, prompt, max_length=150):
+    """
+    Generate response from the model in isolated container.
+    """
+    start_time = time.time()
+    try:
+        model = LLM.objects.get(id=model_id)
+        
+        client = docker.from_env()
+        container = client.containers.run(
+            'llm-executor:latest',
+            command=[str(model.model_file.path), prompt, str(max_length)],
+            volumes={
+                model.model_file.path: {'bind': '/model', 'mode': 'ro'},
+            },
+            detach=True,
+            remove=True,
+            network_disabled=True,
+            mem_limit='2g',
+            cpu_period=100000,
+            cpu_quota=50000
+        )
+        
+        response = container.wait()
+        if response['StatusCode'] != 0:
+            raise Exception("Model execution failed")
+            
+        output = container.logs(stdout=True, stderr=False).decode('utf-8')
+        
+        # Update model statistics
+        execution_time = time.time() - start_time
+        model.usage_count += 1
+        if model.average_response_time:
+            model.average_response_time = (
+                (model.average_response_time * (model.usage_count - 1) + execution_time)
+                / model.usage_count
+            )
+        else:
+            model.average_response_time = execution_time
+        model.save()
+        
+        return output.strip()
+        
+    except Exception as exc:
+        self.retry(exc=exc, countdown=5, max_retries=2)
+```
+
+## **Part 5: Docker Configuration**
+
+### **5.1. Model Validator Dockerfile**
+
+Create `docker/validator/Dockerfile`:
+
+```dockerfile
+FROM python:3.9-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir torch transformers
+
+COPY validate.py .
+ENTRYPOINT ["python", "validate.py"]
+```
+
+Create `docker/validator/validate.py`:
+
+```python
+import sys
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+def validate_model(model_path):
+    """
+    Validate that the model can be loaded and generate text.
+    """
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        model = AutoModelForCausalLM.from_pretrained(model_path)
+        model.eval()
+        
+        # Test generation with a simple prompt
+        inputs = tokenizer("Hello", return_tensors="pt")
+        outputs = model.generate(**inputs, max_length=10)
+        tokenizer.decode(outputs[0])
+        
+        return True
+    except Exception as e:
+        print(f"Validation failed: {str(e)}", file=sys.stderr)
+        return False
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: validate.py <model_path>")
+        sys.exit(1)
+        
+    success = validate_model(sys.argv[1])
+    sys.exit(0 if success else 1)
+```
+
+### **5.2. Model Executor Dockerfile**
+
+Create `docker/executor/Dockerfile`:
+
+```dockerfile
+FROM python:3.9-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir torch transformers
+
+COPY execute.py .
+ENTRYPOINT ["python", "execute.py"]
+```
+
+Create `docker/executor/execute.py`:
+
+```python
+import sys
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+def generate_text(model_path, prompt, max_length=150):
+    """
+    Generate text using the loaded model.
+    """
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        model = AutoModelForCausalLM.from_pretrained(model_path)
+        model.eval()
+        
+        inputs = tokenizer(prompt, return_tensors="pt")
+        outputs = model.generate(
+            **inputs,
+            max_length=max_length,
+            num_return_sequences=1,
+            temperature=0.7,
+            top_k=50,
+            top_p=0.95,
+            do_sample=True
+        )
+        
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        print(response[len(prompt):].strip())
+        return True
+        
+    except Exception as e:
+        print(f"Generation failed: {str(e)}", file=sys.stderr)
+        return False
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: execute.py <model_path> <prompt> [max_length]")
+        sys.exit(1)
+        
+    model_path = sys.argv[1]
+    prompt = sys.argv[2]
+    max_length = int(sys.argv[3]) if len(sys.argv) > 3 else 150
+    
+    success = generate_text(model_path, prompt, max_length)
+    sys.exit(0 if success else 1)
+```
+
+### **5.3. Docker Compose Configuration**
+
+Create `docker-compose.yml` in the project root:
+
+```yaml
+version: '3.8'
+
+services:
+  web:
+    build: .
+    command: gunicorn llm_network.wsgi:application --bind 0.0.0.0:8000
+    volumes:
+      - .:/app
+      - media_volume:/app/media
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+    env_file:
+      - .env
+
+  celery:
+    build: .
+    command: celery -A llm_network worker -l INFO
+    volumes:
+      - .:/app
+      - media_volume:/app/media
+    depends_on:
+      - redis
+    env_file:
+      - .env
+
+  db:
+    image: postgres:13
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=llm_network
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+
+  redis:
+    image: redis:6
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
+  media_volume:
+```
+
+## **Part 6: Security Considerations**
+
+### **6.1. Model Execution Security**
+
+1. Use containerization for model execution
+2. Implement resource limits
+3. Disable network access for model containers
+4. Validate model files before execution
+5. Implement timeouts for model execution
+
+### **6.2. User Authentication and Authorization**
+
+1. Use JWT tokens with short expiration
+2. Implement rate limiting
+3. Add permission checks for model management
+4. Validate file uploads
+5. Implement user verification
+
+### **6.3. Content Moderation**
+
+1. Implement toxicity filtering
+2. Add user reporting functionality
+3. Create moderation queue
+4. Implement automatic content filtering
+5. Add admin review system
+
+## **Part 7: Testing**
+
+### **7.1. Unit Tests**
+
+Create `tests/test_models.py`:
+
+```python
+import pytest
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.contrib.auth import get_user_model
+from models_hub.models import LLM
+
+@pytest.mark.django_db
+class TestLLMModel:
+    @pytest.fixture
+    def user(self):
+        User = get_user_model()
+        return User.objects.create_user(
+            username='testuser',
+            password='testpass'
+        )
+    
+    @pytest.fixture
+    def model_file(self):
+        return SimpleUploadedFile(
+            "model.pt",
+            b"file_content",
+            content_type="application/octet-stream"
+        )
+    
+    def test_create_llm(self, user, model_file):
+        llm = LLM.objects.create(
+            name="Test Model",
+            description="Test Description",
+            owner=user,
+            model_file=model_file
+        )
+        assert llm.status == LLM.ModelStatus.UPLOADING
+        assert llm.is_public
+        assert llm.usage_count == 0
+```
+
+### **7.2. Integration Tests**
+
+Create `tests/test_api.py`:
+
+```python
+import pytest
+from rest_framework.test import APIClient
+from django.urls import reverse
+
+@pytest.mark.django_db
+class TestLLMAPI:
+    @pytest.fixture
+    def api_client(self):
+        return APIClient()
+    
+    @pytest.fixture
+    def authenticated_client(self, api_client, user):
+        api_client.force_authenticate(user=user)
+        return api_client
+    
+    def test_list_models(self, authenticated_client):
+        url = reverse('llm-list')
+        response = authenticated_client.get(url)
+        assert response.status_code == 200
+```
+
+## **Part 8: Deployment**
+
+### **8.1. Production Settings**
+
+Create `llm_network/settings_prod.py`:
+
+```python
+from .settings import *
+
+DEBUG = False
+SECURE_SSL_REDIRECT = True
+SESSION_COOKIE_SECURE = True
+CSRF_COOKIE_SECURE = True
+SECURE_BROWSER_XSS_FILTER = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = 'DENY'
+
+# Add production-specific settings
+```
+# **Monitoring, Logging, and Scaling Implementation Guide**
+
+## **1. Monitoring and Logging Setup**
+
+### **1.1 Sentry Configuration**
+
+First, install Sentry:
+```bash
+pip install --upgrade 'sentry-sdk[django]'
+```
+
+Add to `settings.py`:
+```python
+import sentry_sdk
+from sentry_sdk.integrations.django import DjangoIntegration
+from sentry_sdk.integrations.celery import CeleryIntegration
+from sentry_sdk.integrations.redis import RedisIntegration
+
+sentry_sdk.init(
+    dsn="your-sentry-dsn",
+    integrations=[
+        DjangoIntegration(),
+        CeleryIntegration(),
+        RedisIntegration(),
+    ],
+    traces_sample_rate=0.1,
+    send_default_pii=False,
+    environment=os.getenv('ENVIRONMENT', 'production'),
+)
+```
+
+### **1.2 Prometheus and Grafana Setup**
+
+Create `monitoring/prometheus.yml`:
+```yaml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'django'
+    static_configs:
+      - targets: ['web:8000']
+
+  - job_name: 'celery'
+    static_configs:
+      - targets: ['celery:8001']
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+```
+
+Install Django Prometheus:
+```bash
+pip install django-prometheus
+```
+
+Add to `settings.py`:
+```python
+INSTALLED_APPS += ['django_prometheus']
+
+MIDDLEWARE = [
+    'django_prometheus.middleware.PrometheusBeforeMiddleware',
+    # ... existing middleware ...
+    'django_prometheus.middleware.PrometheusAfterMiddleware',
+]
+```
+
+### **1.3 ELK Stack Configuration**
+
+Create `monitoring/logstash.conf`:
+```conf
+input {
+  beats {
+    port => 5044
+  }
+}
+
+filter {
+  if [type] == "django" {
+    grok {
+      match => { "message" => "%{TIMESTAMP_ISO8601:timestamp} %{LOGLEVEL:level} %{GREEDYDATA:message}" }
+    }
+  }
+}
+
+output {
+  elasticsearch {
+    hosts => ["elasticsearch:9200"]
+    index => "llm-network-%{+YYYY.MM.dd}"
+  }
+}
+```
+
+Update `settings.py` for logging:
+```python
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '{levelname} {asctime} {module} {process:d} {thread:d} {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'file': {
+            'level': 'INFO',
+            'class': 'logging.FileHandler',
+            'filename': 'logs/llm_network.log',
+            'formatter': 'verbose',
+        },
+        'console': {
+            'level': 'DEBUG',
+            'class': 'logging.StreamHandler',
+            'formatter': 'verbose',
+        },
+    },
+    'loggers': {
+        'django': {
+            'handlers': ['file', 'console'],
+            'level': 'INFO',
+            'propagate': True,
+        },
+        'models_hub': {
+            'handlers': ['file', 'console'],
+            'level': 'DEBUG',
+            'propagate': True,
+        },
+    },
+}
+```
+
+### **1.4 Health Checks**
+
+Create `monitoring/health_checks.py`:
+```python
+from django.db import connections
+from django.db.utils import OperationalError
+from redis import Redis
+from redis.exceptions import RedisError
+import os
+
+def check_database():
+    try:
+        for name in connections.databases:
+            cursor = connections[name].cursor()
+            cursor.execute("SELECT 1")
+            row = cursor.fetchone()
+            if row is None:
+                return False
+            cursor.close()
+        return True
+    except OperationalError:
+        return False
+
+def check_redis():
+    try:
+        redis_client = Redis.from_url(os.getenv('REDIS_URL'))
+        return redis_client.ping()
+    except RedisError:
+        return False
+
+def check_celery():
+    try:
+        from celery.app.control import Control
+        from llm_network.celery import app
+        
+        control = Control(app)
+        workers = control.inspect().active()
+        return workers is not None
+    except:
+        return False
+```
+
+Add health check URLs in `urls.py`:
+```python
+from django.urls import path
+from .monitoring import health_checks
+
+urlpatterns += [
+    path('health/', health_checks.check_health, name='health'),
+    path('readiness/', health_checks.check_readiness, name='readiness'),
+]
+```
+
+## **2. Scaling Configuration**
+
+### **2.1 Kubernetes Deployment**
+
+Create `k8s/web-deployment.yaml`:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-network-web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: llm-network-web
+  template:
+    metadata:
+      labels:
+        app: llm-network-web
+    spec:
+      containers:
+      - name: web
+        image: llm-network:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: llm-network-secrets
+              key: database-url
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: llm-network-secrets
+              key: redis-url
+        livenessProbe:
+          httpGet:
+            path: /health/
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /readiness/
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 5
+```
+
+### **2.2 Redis Caching**
+
+Update `settings.py`:
+```python
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': os.getenv('REDIS_URL'),
+        'OPTIONS': {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            'PARSER_CLASS': 'redis.connection.HiredisParser',
+            'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
+            'IGNORE_EXCEPTIONS': True,
+        }
+    }
+}
+
+# Cache settings
+CACHE_TTL = 60 * 15  # 15 minutes
+SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
+SESSION_CACHE_ALIAS = 'default'
+```
+
+Implement caching in views:
+```python
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import cache_page
+from django.conf import settings
+
+class LLMViewSet(viewsets.ModelViewSet):
+    @method_decorator(cache_page(settings.CACHE_TTL))
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @method_decorator(cache_page(settings.CACHE_TTL))
+    def retrieve(self, request, *args, **kwargs):
+        return super().retrieve(request, *args, **kwargs)
+```
+
+### **2.3 CDN Configuration**
+
+Update `settings.py`:
+```python
+# AWS S3 Configuration for static files
+AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+AWS_STORAGE_BUCKET_NAME = os.getenv('AWS_STORAGE_BUCKET_NAME')
+AWS_S3_CUSTOM_DOMAIN = f'{AWS_STORAGE_BUCKET_NAME}.s3.amazonaws.com'
+AWS_S3_OBJECT_PARAMETERS = {
+    'CacheControl': 'max-age=86400',
+}
+
+# Static files configuration
+STATICFILES_STORAGE = 'storages.backends.s3boto3.S3Boto3Storage'
+STATIC_URL = f'https://{AWS_S3_CUSTOM_DOMAIN}/static/'
+
+# Media files configuration
+DEFAULT_FILE_STORAGE = 'storages.backends.s3boto3.S3Boto3Storage'
+MEDIA_URL = f'https://{AWS_S3_CUSTOM_DOMAIN}/media/'
+```
+
+### **2.4 Load Balancing**
+
+Create `k8s/ingress.yaml`:
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llm-network-ingress
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+spec:
+  rules:
+  - host: llm-network.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: llm-network-web
+            port:
+              number: 8000
+```
+
+### **2.5 Database Replication**
+
+Create `k8s/postgres-statefulset.yaml`:
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres
+  replicas: 2
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:13
+        env:
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secrets
+              key: password
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 10Gi
+```
+
+## **3. Next Steps Implementation**
+
+### **3.1 WebSocket Support**
+
+Install channels:
+```bash
+pip install channels channels-redis
+```
+
+Update `settings.py`:
+```python
+INSTALLED_APPS += ['channels']
+ASGI_APPLICATION = 'llm_network.asgi.application'
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        'CONFIG': {
+            "hosts": [(os.getenv('REDIS_URL'))],
+        },
+    },
+}
+```
+
+Create `consumers.py`:
+```python
+from channels.generic.websocket import AsyncJsonWebsocketConsumer
+
+class LLMConsumer(AsyncJsonWebsocketConsumer):
+    async def connect(self):
+        await self.accept()
+        await self.channel_layer.group_add("llm_updates", self.channel_name)
+
+    async def disconnect(self, close_code):
+        await self.channel_layer.group_discard("llm_updates", self.channel_name)
+
+    async def llm_update(self, event):
+        await self.send_json(event['data'])
+```
+
+### **3.2 Model Versioning**
+
+Add to `models_hub/models.py`:
+```python
+class ModelVersion(models.Model):
+    llm = models.ForeignKey(LLM, on_delete=models.CASCADE, related_name='versions')
+    version = models.CharField(max_length=50)
+    model_file = models.FileField(upload_to='llm_versions/')
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_active = models.BooleanField(default=False)
+    
+    class Meta:
+        unique_together = ('llm', 'version')
+        ordering = ['-created_at']
+```
+
+### **3.3 User Following System**
+
+Add to `accounts/models.py`:
+```python
+class UserFollow(models.Model):
+    follower = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='following'
+    )
+    following = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='followers'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        unique_together = ('follower', 'following')
+```
